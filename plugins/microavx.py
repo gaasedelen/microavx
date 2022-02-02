@@ -17,7 +17,7 @@ import ida_hexrays
 #-----------------------------------------------------------------------------
 
 # an empty / NULL mop_t
-NO_MOP = ida_hexrays.mop_t()
+NO_MOP = None
 
 # EVEX-encoded instruction, intel.hpp (ida sdk)
 AUX_EVEX = 0x10000
@@ -1192,6 +1192,7 @@ class MicroAVX(ida_idaapi.plugin_t):
         """
         This is called by IDA when it is loading the plugin.
         """
+        global NO_MOP
 
         # only bother to load the plugin for relevant sessions
         if not is_amd64_idb():
@@ -1200,6 +1201,7 @@ class MicroAVX(ida_idaapi.plugin_t):
         # ensure the x64 decompiler is loaded
         ida_loader.load_plugin("hexx64")
         assert ida_hexrays.init_hexrays_plugin(), "Missing Hexx64 Decompiler..."
+        NO_MOP = ida_hexrays.mop_t()
 
         # initialize the AVX lifter 
         self.avx_lifter = AVXLifter()

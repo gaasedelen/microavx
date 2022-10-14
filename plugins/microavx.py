@@ -11,6 +11,7 @@ import ida_loader
 import ida_kernwin
 import ida_typeinf
 import ida_hexrays
+import traceback
 
 #-----------------------------------------------------------------------------
 # Util
@@ -281,6 +282,23 @@ class AVXIntrinsic(object):
         """
         self.cdg.mb.insert_into_block(self.mov_insn, self.cdg.mb.tail)
 
+
+class garbage_remover_t(ida_hexrays.minsn_visitor_t):
+    """
+    remove duplicate instructions introduced by store_operand_hack?
+    """
+    def __init__(self, ea):
+        ida_hexrays.minsn_visitor_t.__init__(self)
+        self.addr = ea
+        self.insns = []
+
+    def visit_minsn(self):
+        ins = self.curins
+
+        if ins.ea == self.addr:
+            self.insns.append(ins)
+        return 0
+
 #-----------------------------------------------------------------------------
 # AVX Lifter
 #-----------------------------------------------------------------------------
@@ -362,12 +380,28 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
             return False
         return cdg.insn.itype in self._avx_handlers
 
+    def remove_store_operand_hack_dupinstrs(self, cdg, insn):
+        gc = garbage_remover_t(insn.ea)
+        cdg.mb.for_all_insns(gc)
+        if len(gc.insns) >= 1:
+            print(f'found {len(gc.insns)} duplicate microcode instructions for {insn.ea:x} ')
+            for instr in gc.insns:
+                cdg.mb.remove_from_block(instr)
+
     def apply(self, cdg):
         """
         Generate microcode for the current instruction.
         """
-        cdg.store_operand = lambda x, y: store_operand_hack(cdg, x, y)
-        return self._avx_handlers[cdg.insn.itype](cdg, cdg.insn)
+        try:
+            cdg.store_operand = lambda x, y: store_operand_hack(cdg, x, y)
+            self.remove_store_operand_hack_dupinstrs(cdg, cdg.insn)
+            self.cdg = cdg
+            result = self._avx_handlers[cdg.insn.itype](cdg, cdg.insn)
+            self.cdg = None
+            return result
+        except Exception as err:
+            print(f'addr = {cdg.insn.ea:x}, x  = {traceback.format_exc()}')
+            return ida_hexrays.MERR_INSN
 
     def install(self):
         """

@@ -11,13 +11,14 @@ import ida_loader
 import ida_kernwin
 import ida_typeinf
 import ida_hexrays
+import traceback
 
 #-----------------------------------------------------------------------------
 # Util
 #-----------------------------------------------------------------------------
 
 # an empty / NULL mop_t
-NO_MOP = ida_hexrays.mop_t()
+NO_MOP = None
 
 # EVEX-encoded instruction, intel.hpp (ida sdk)
 AUX_EVEX = 0x10000
@@ -32,6 +33,9 @@ FLOAT_SIZE = 4
 DOUBLE_SIZE = 8
 DWORD_SIZE = 4
 QWORD_SIZE = 8
+
+R_ax = 0
+R_r15 = 15
 
 def size_of_operand(op):
     """
@@ -103,6 +107,15 @@ def is_avx_512(insn):
     Return true if the given insn_t is an AVX512 instruction.
     """
     return bool(insn.auxpref & AUX_EVEX)
+
+def is_gpr32(op):
+    return op.type == ida_ua.o_reg and op.dtype == ida_ua.dt_dword and R_ax <= op.reg <= R_di
+
+def is_gpr64(op):
+    return op.type == ida_ua.o_reg and op.dtype == ida_ua.dt_qword and R_ax <= op.reg <= R_r15
+
+def is_gpr(op):
+    return is_gpr32(op) or is_gpr64(op)
 
 #-----------------------------------------------------------------------------
 # Microcode Helpers
@@ -281,6 +294,23 @@ class AVXIntrinsic(object):
         """
         self.cdg.mb.insert_into_block(self.mov_insn, self.cdg.mb.tail)
 
+
+class garbage_remover_t(ida_hexrays.minsn_visitor_t):
+    """
+    remove duplicate instructions introduced by store_operand_hack?
+    """
+    def __init__(self, ea):
+        ida_hexrays.minsn_visitor_t.__init__(self)
+        self.addr = ea
+        self.insns = []
+
+    def visit_minsn(self):
+        ins = self.curins
+
+        if ins.ea == self.addr:
+            self.insns.append(ins)
+        return 0
+
 #-----------------------------------------------------------------------------
 # AVX Lifter
 #-----------------------------------------------------------------------------
@@ -292,6 +322,7 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
 
     def __init__(self):
         super(AVXLifter, self).__init__()
+        self.cdg = None
         self._avx_handlers = \
         {
 
@@ -303,10 +334,13 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
 
             # Conversions
             ida_allins.NN_vcvttss2si: self.vcvttss2si,
+            ida_allins.NN_vcvttsd2si: self.vcvttsd2si,
             ida_allins.NN_vcvtdq2ps: self.vcvtdq2ps,
             ida_allins.NN_vcvtsi2ss: self.vcvtsi2ss,
+            ida_allins.NN_vcvtsi2sd: self.vcvtsi2sd,
             ida_allins.NN_vcvtps2pd: self.vcvtps2pd,
             ida_allins.NN_vcvtss2sd: self.vcvtss2sd,
+            ida_allins.NN_vcvtsd2ss: self.vcvtsd2ss,
 
             # Mov (DWORD / QWORD)
             ida_allins.NN_vmovd: self.vmovd,
@@ -322,10 +356,15 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
             ida_allins.NN_vmovdqa: self.v_mov_ps_dq,
             ida_allins.NN_vmovdqu: self.v_mov_ps_dq,
 
+            ida_allins.NN_vmovupd: self.v_mov_ps_dq,
+            ida_allins.NN_vmovapd: self.v_mov_ps_dq,
+
             # Bitwise (Packed Single-Precision)
             ida_allins.NN_vorps: self.v_bitwise_ps,
             ida_allins.NN_vandps: self.v_bitwise_ps,
+            ida_allins.NN_vandpd: self.v_bitwise_ps,
             ida_allins.NN_vxorps: self.v_bitwise_ps,
+            ida_allins.NN_vxorpd: self.v_bitwise_ps,
 
             # Math (Scalar Single-Precision)
             ida_allins.NN_vaddss: self.v_math_ss,
@@ -345,6 +384,10 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
             ida_allins.NN_vmulps: self.v_math_ps,
             ida_allins.NN_vdivps: self.v_math_ps,
 
+            ida_allins.NN_vaddpd: self.v_math_ps,
+            ida_allins.NN_vsubpd: self.v_math_ps,
+            ida_allins.NN_vmulpd: self.v_math_ps,
+
             # Square Root
             ida_allins.NN_vsqrtss: self.vsqrtss,
             ida_allins.NN_vsqrtps: self.vsqrtps,
@@ -352,6 +395,30 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
             # Shuffle (Packed Single-Precision) 
             ida_allins.NN_vshufps: self.vshufps,
 
+            ida_allins.NN_vfmadd132sd: self.vfmadd132sd,
+            ida_allins.NN_vfmadd213sd: self.vfmadd213sd,
+            ida_allins.NN_vfmadd231sd: self.vfmadd231sd,
+            ida_allins.NN_vfnmadd132sd: self.vfnmadd132sd,
+            ida_allins.NN_vfnmadd213sd: self.vfnmadd213sd,
+            ida_allins.NN_vfnmadd231sd: self.vfnmadd231sd,
+            ida_allins.NN_vmaxsd: self.vmaxsd,
+            ida_allins.NN_vminsd: self.vminsd,
+            ida_allins.NN_vpxor: self.vpxor,
+            ida_allins.NN_vfmsub132sd: self.vfmsub132sd,
+            ida_allins.NN_vfmsub213sd: self.vfmsub213sd,
+            ida_allins.NN_vfmsub231sd: self.vfmsub231sd,
+            ida_allins.NN_vroundsd: self.vroundsd,
+
+            #vblendvpd
+            #vfmadd231pd
+            #vcmpnltsd
+
+            #vsqrtsd
+            #vunpckhpd
+            #vextractf128
+            #vpermilpd
+            #vperm2f128
+            #vblendpd
         }
 
     def match(self, cdg):
@@ -362,12 +429,28 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
             return False
         return cdg.insn.itype in self._avx_handlers
 
+    def remove_store_operand_hack_dupinstrs(self, cdg, insn):
+        gc = garbage_remover_t(insn.ea)
+        cdg.mb.for_all_insns(gc)
+        if len(gc.insns) >= 1:
+            print(f'found {len(gc.insns)} duplicate microcode instructions for {insn.ea:x} ')
+            for instr in gc.insns:
+                cdg.mb.remove_from_block(instr)
+
     def apply(self, cdg):
         """
         Generate microcode for the current instruction.
         """
-        cdg.store_operand = lambda x, y: store_operand_hack(cdg, x, y)
-        return self._avx_handlers[cdg.insn.itype](cdg, cdg.insn)
+        try:
+            cdg.store_operand = lambda x, y: store_operand_hack(cdg, x, y)
+            self.remove_store_operand_hack_dupinstrs(cdg, cdg.insn)
+            self.cdg = cdg
+            result = self._avx_handlers[cdg.insn.itype](cdg, cdg.insn)
+            self.cdg = None
+            return result
+        except Exception as err:
+            print(f'addr = {cdg.insn.ea:x}, x  = {traceback.format_exc()}')
+            return ida_hexrays.MERR_INSN
 
     def install(self):
         """
@@ -383,47 +466,200 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         ida_hexrays.install_microcode_filter(self, False)
         print("Removed AVX lifter...")
 
+    def decode_error(self, msg):
+        print(f'{self.cdg.insn.ea:x}: {msg}')
+        return ida_hexrays.MERR_INSN
+
+    def xmmreg(self, op):
+        if is_xmm_reg(op):
+            result = ida_hexrays.reg2mreg(op.reg)
+        else:
+            result = None
+        return result
+
+    def xmm_or_mem(self, op):
+        if is_xmm_reg(op):
+            result = ida_hexrays.reg2mreg(op.reg)
+        elif is_mem_op(op):
+            result = self.cdg.load_operand(op.n)
+        else:
+            result = None
+        return result
+
+    def xmm1_xmm2_or_mem2(self):
+        result = None
+        insn = self.cdg.insn
+        s = self.xmm_or_mem(insn.Op2)
+        if s is not None:
+            d = self.xmmreg(insn.Op1)
+            if d is not None:
+                result = (d, s)
+            else:
+                self.decode_error('op1')
+        else:
+            self.decode_error('op2')
+        return result
+
+    def xmm1_xmm2_xmm3_or_mem3(self):
+        result = None
+        insn = self.cdg.insn
+        c = self.xmm_or_mem(insn.Op3)
+        if c is not None:
+            b = self.xmmreg(insn.Op2)
+            if b is not None:
+                a = self.xmmreg(insn.Op1)
+                if a is not None:
+                    result = (a, b, c)
+                else:
+                    self.decode_error('op1')
+            else:
+                self.decode_error('op2')
+        else:
+            self.decode_error('op3')
+        return result
+
+    def save_upper_bits(self, mreg, reg_size):
+        # create a temp register to compute the final result into
+        treg = self.cdg.mba.alloc_kreg(reg_size)
+
+        # populate the dest reg
+        self.cdg.emit(ida_hexrays.m_mov, reg_size, mreg, 0, treg, 0)
+        return treg
+
+    def alloc_reg(self, reg_size):
+        return self.cdg.mba.alloc_kreg(reg_size)
+
+    def free_reg(self, reg, reg_size):
+        self.cdg.mba.free_kreg(reg, reg_size)
+
+    def emit_fp_instr_l_r_d(self, opcode, l, r, d):
+        instr = ida_hexrays.minsn_t(self.cdg.insn.ea)
+        instr.opcode = opcode
+        instr.l = l
+        instr.r = r
+        instr.d = d
+        instr.set_fpinsn()
+        self.cdg.mb.insert_into_block(instr, self.cdg.mb.tail)
+
+    def emit_fp_instr_l_d(self, opcode, l, d):
+        instr = ida_hexrays.minsn_t(self.cdg.insn.ea)
+        instr.opcode = opcode
+        instr.l = l
+        instr.r.zero()
+        instr.d = d
+        instr.set_fpinsn()
+        self.cdg.mb.insert_into_block(instr, self.cdg.mb.tail)
+
+    def emit_clear_dst(self, d):
+        nil = ida_hexrays.mop_t()
+        nil.make_number(0, d.size)
+        instr = ida_hexrays.minsn_t(self.cdg.insn.ea)
+        instr.opcode = ida_hexrays.m_mov
+        instr.l = nil
+        instr.r.zero()
+        instr.d = d
+        self.cdg.mb.insert_into_block(instr, self.cdg.mb.tail)
+
+    def emit_clear_ymm(self, xmm_mreg):
+        #nil = ida_hexrays.mop_t()
+        #nil.make_number(0, YMM_SIZE)
+        t = self.alloc_reg(YMM_SIZE)
+        t_mop = ida_hexrays.mop_t(t, YMM_SIZE)
+
+        xmm_mop = ida_hexrays.mop_t(xmm_mreg, XMM_SIZE)
+
+        ymm_mreg = get_ymm_mreg(xmm_mreg)
+        ymm_mop = ida_hexrays.mop_t(ymm_mreg, YMM_SIZE)
+        self.cdg.emit(ida_hexrays.m_xdu, xmm_mop, NO_MOP, t_mop)
+        self.cdg.emit(ida_hexrays.m_mov, t_mop, NO_MOP, ymm_mop)
+        self.free_reg(t, YMM_SIZE)
+
+
+    def emit_clear_flag(self, mreg):
+        self.emit_clear_dst(ida_hexrays.mop_t(mreg, 1))
+
+    def emit_copy_bits_xmm_wide(self, dst, src):
+        self.cdg.emit(ida_hexrays.m_mov, ida_hexrays.mop_t(src, XMM_SIZE), NO_MOP, ida_hexrays.mop_t(dst, XMM_SIZE))
+
+    def emit_function_call2(self, r, func_name, p1, p2, is_pure):
+        avx_intrinsic = AVXIntrinsic(self.cdg, func_name)
+        (reg, typ) = p1
+        avx_intrinsic.add_argument_reg_basic(reg, typ)
+        (reg, typ) = p2
+        avx_intrinsic.add_argument_reg_basic(reg, typ)
+        (reg, typ) = r
+        avx_intrinsic.set_return_reg_basic(reg, typ)
+        if is_pure:
+            avx_intrinsic.call_info.flags |= ida_hexrays.FCI_PURE
+        avx_intrinsic.emit()
+
     #--------------------------------------------------------------------------
     # Compare Instructions
     #--------------------------------------------------------------------------
 
-    #
-    # the intel manual states that all of these comparison instructions are
-    # effectively identical to their SSE counterparts. because of this, we
-    # simply twiddle the decoded insn to make it appear as SSE and bail.
-    #
-    # since the decompiler appears to operate on the same decoded instruction
-    # data that we meddled with, it will lift the instruction in the same way
-    # it would lift the SSE version we alias each AVX one to.
-    #
+    def v_comis_(self, data_size):
+        """
+        COMISS (all versions)
+        RESULT :=OrderedCompare(DEST[31:0] <> SRC[31:0]) {
+        (V)UCOMISS (all versions)
+        RESULT := UnorderedCompare(DEST[31:0] <> SRC[31:0]) {
+        COMISD (all versions)
+        RESULT :=OrderedCompare(DEST[63:0] <> SRC[63:0]) {
+        (V)UCOMISD (all versions)
+        RESULT := UnorderedCompare(DEST[63:0] <> SRC[63:0]) {
+
+        (* Set EFLAGS *) CASE (RESULT) OF
+        UNORDERED: ZF,PF,CF := 111;
+        GREATER_THAN: ZF,PF,CF := 000;
+        LESS_THAN: ZF,PF,CF := 001;
+        EQUAL: ZF,PF,CF := 100;
+        ESAC;
+        OF, AF, SF := 0; }
+        """
+        regs = self.xmm1_xmm2_or_mem2()
+        if regs is None:
+            return ida_hexrays.MERR_INSN
+
+        (l_reg, r_reg) = regs
+        L = ida_hexrays.mop_t(l_reg, data_size)
+        R = ida_hexrays.mop_t(r_reg, data_size)
+        self.emit_function_call2(
+            (ida_hexrays.mr_pf, ida_typeinf.BTF_BOOL),
+            'std::isunordered',
+            (l_reg, ida_typeinf.BTF_DOUBLE),
+            (r_reg, ida_typeinf.BTF_DOUBLE),
+            True)
+        self.emit_fp_instr_l_r_d(ida_hexrays.m_setb, L, R, ida_hexrays.mop_t(ida_hexrays.mr_cf, 1))
+        self.emit_fp_instr_l_r_d(ida_hexrays.m_setz, L, R, ida_hexrays.mop_t(ida_hexrays.mr_zf, 1))
+        self.emit_clear_flag(ida_hexrays.mr_of)
+        #self.emit_clear_flag(ida_hexrays.reg2mreg(R_af))
+        self.emit_clear_flag(ida_hexrays.mr_sf)
+
+        return ida_hexrays.MERR_OK
 
     def vcomiss(self, cdg, insn):
         """
         VCOMISS xmm1, xmm2/m32
         """
-        insn.itype = ida_allins.NN_comiss
-        return ida_hexrays.MERR_INSN
+        return self.v_comis_(FLOAT_SIZE)
 
     def vucomiss(self, cdg, insn):
         """
         VUCOMISS xmm1, xmm2/m32
         """
-        insn.itype = ida_allins.NN_ucomiss
-        return ida_hexrays.MERR_INSN
+        return self.v_comis_(FLOAT_SIZE)
 
     def vcomisd(self, cdg, insn):
         """
         VCOMISD xmm1, xmm2/m64
         """
-        insn.itype = ida_allins.NN_comisd
-        return ida_hexrays.MERR_INSN
+        return self.v_comis_(DOUBLE_SIZE)
 
     def vucomisd(self, cdg, insn):
         """
         VUCOMISD xmm1, xmm2/m64
         """
-        insn.itype = ida_allins.NN_ucomisd
-        return ida_hexrays.MERR_INSN
+        return self.v_comis_(DOUBLE_SIZE)
 
     #-------------------------------------------------------------------------
     # Conversion Instructions
@@ -436,6 +672,32 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         """
         insn.itype = ida_allins.NN_cvttss2si
         return ida_hexrays.MERR_INSN
+
+    def vcvttsd2si(self, cdg, insn):
+        """
+        VCVTTSD2SI r32, xmm1/m64
+        VCVTTSD2SI r64, xmm1/m64
+        """
+        s1 = self.xmm_or_mem(insn.Op2)
+        if s1 is None:
+            return self.decode_error('op2 - expected xmm reg or mem ptr')
+
+        dst_size = 0
+        if is_gpr32(insn.Op1):
+            dst_size = 4
+        elif is_gpr64(insn.Op1):
+            dst_size = 8
+        else:
+            return self.decode_error('op1 - expected gpr32 or gpr64')
+
+        d_reg = ida_hexrays.reg2mreg(insn.Op1.reg)
+
+        s1_mop = ida_hexrays.mop_t(s1, DOUBLE_SIZE)
+        t1 = self.alloc_reg(dst_size)
+        t1_mop = ida_hexrays.mop_t(t1, dst_size)
+        cdg.emit(ida_hexrays.m_f2i, s1_mop, NO_MOP, t1_mop)
+        cdg.emit(ida_hexrays.m_mov, dst_size, t1, 0, d_reg, 0)
+        return ida_hexrays.MERR_OK
 
     def vcvtdq2ps(self, cdg, insn):
         """
@@ -477,12 +739,15 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
 
         return ida_hexrays.MERR_OK
 
-    def vcvtsi2ss(self, cdg, insn):
+    def _vcvtsi2_ss_sd(self, cdg, insn, dst_size):
         """
         VCVTSI2SS xmm1, xmm2, r/m32
         VCVTSI2SS xmm1, xmm2, r/m64
+
+        VCVTSI2SD xmm1, xmm2, r/m32
+        VCVTSI2SD xmm1, xmm2, r/m64
         """
-        src_size = size_of_operand(insn.Op3)
+        src2_size = size_of_operand(insn.Op3)
 
         # op3 -- m32/m64
         if is_mem_op(insn.Op3):
@@ -500,31 +765,40 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         d_reg = ida_hexrays.reg2mreg(insn.Op1.reg)
 
         # create a temp register to compute the final result into
-        t0_result = cdg.mba.alloc_kreg(XMM_SIZE)
-        t0_mop = ida_hexrays.mop_t(t0_result, FLOAT_SIZE)
+        src1_treg = cdg.mba.alloc_kreg(XMM_SIZE)
+        src1_treg_mop_data_size = ida_hexrays.mop_t(src1_treg, dst_size)
 
         # create a temp register to downcast a double to a float (if needed)
-        t1_i2f = cdg.mba.alloc_kreg(src_size)
-        t1_mop = ida_hexrays.mop_t(t1_i2f, src_size)
+        src2_treg = cdg.mba.alloc_kreg(src2_size)
+        src2_treg_mop_src2_size = ida_hexrays.mop_t(src2_treg, src2_size)
 
         # copy xmm2 into the temp result reg, as we need its upper 3 dwords
-        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, l_reg, 0, t0_result, 0)
+        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, l_reg, 0, src1_treg, 0)
 
         # convert the integer (op3) to a float/double depending on its size
-        cdg.emit(ida_hexrays.m_i2f, src_size, r_reg, 0, t1_i2f, 0)
+        cdg.emit(ida_hexrays.m_i2f, src2_size, r_reg, 0, src2_treg, 0)
 
-        # reduce precision on the converted floating point value if needed (only r64/m64)
-        cdg.emit(ida_hexrays.m_f2f, t1_mop, NO_MOP, t0_mop)
+        if dst_size != src2_size:
+            # reduce precision on the converted floating point value if needed (only r64/m64)
+            cdg.emit(ida_hexrays.m_f2f, src2_treg_mop_src2_size, NO_MOP, src1_treg_mop_data_size)
+        else:
+            cdg.emit(ida_hexrays.m_mov, src2_treg_mop_src2_size, NO_MOP, src1_treg_mop_data_size)
 
         # transfer the fully computed temp register to the real dest reg 
-        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, t0_result, 0, d_reg, 0)
-        cdg.mba.free_kreg(t0_result, XMM_SIZE)
-        cdg.mba.free_kreg(t1_i2f, src_size)
-        
+        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, src1_treg, 0, d_reg, 0)
+        cdg.mba.free_kreg(src1_treg, XMM_SIZE)
+        cdg.mba.free_kreg(src2_treg, src2_size)
+
         # clear upper 128 bits of ymm1
         clear_upper(cdg, d_reg)
 
         return ida_hexrays.MERR_OK
+
+    def vcvtsi2ss(self, cdg, insn):
+        return self._vcvtsi2_ss_sd(cdg, insn, FLOAT_SIZE)
+
+    def vcvtsi2sd(self, cdg, insn):
+        return self._vcvtsi2_ss_sd(cdg, insn, DOUBLE_SIZE)
 
     def vcvtps2pd(self, cdg, insn):
         """
@@ -607,6 +881,42 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
 
         return ida_hexrays.MERR_OK
 
+    def vcvtsd2ss(self, cdg, insn):
+        """
+        VCVTSD2SS xmm1,xmm2,xmm3/m64
+        """
+        regs = self.xmm1_xmm2_xmm3_or_mem3()
+        if regs is None:
+            return ida_hexrays.MERR_INSN
+        (d_reg, l_reg, r_reg) = regs
+
+        r_mop = ida_hexrays.mop_t(r_reg, DOUBLE_SIZE)
+
+        # op2 -- xmm2
+        l_reg = ida_hexrays.reg2mreg(insn.Op2.reg)
+
+        # op1 -- xmm1
+        d_reg = ida_hexrays.reg2mreg(insn.Op1.reg)
+
+        # create a temp register to compute the final result into
+        t0_result = cdg.mba.alloc_kreg(XMM_SIZE)
+        t0_mop = ida_hexrays.mop_t(t0_result, FLOAT_SIZE)
+
+        # copy xmm2 into the temp result reg, as we need its upper quadword
+        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, l_reg, 0, t0_result, 0)
+
+        # convert float (op3) to a double, storing it in the lower 64 of the temp result reg
+        cdg.emit(ida_hexrays.m_f2f, r_mop, NO_MOP, t0_mop)
+
+        # transfer the fully computed temp register to the real dest reg
+        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, t0_result, 0, d_reg, 0)
+        cdg.mba.free_kreg(t0_result, XMM_SIZE)
+
+        # clear upper 128 bits of ymm1
+        clear_upper(cdg, d_reg)
+
+        return ida_hexrays.MERR_OK
+
     #-------------------------------------------------------------------------
     # Mov Instructions
     #-------------------------------------------------------------------------
@@ -618,7 +928,7 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         VMOVSS xmm1, xmm2, xmm3	
         VMOVSS m32, xmm1
         """
-        return self._vmov_ss_sd(cdg, insn, FLOAT_SIZE)
+        return self.vmovs_(cdg, insn, FLOAT_SIZE)
 
     def vmovsd(self, cdg, insn):
         """
@@ -627,9 +937,9 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         VMOVSD xmm1, xmm2, xmm3
         VMOVSD m64, xmm1
         """
-        return self._vmov_ss_sd(cdg, insn, DOUBLE_SIZE)
+        return self.vmovs_(cdg, insn, DOUBLE_SIZE)
 
-    def _vmov_ss_sd(self, cdg, insn, data_size):
+    def vmovs_(self, cdg, insn, data_size):
         """
         Templated handler for scalar float/double mov instructions.
         """
@@ -638,60 +948,34 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         if insn.Op3.type == ida_ua.o_void:
 
             # op form: xmm1, m32/m64
-            if is_xmm_reg(insn.Op1):
-                assert is_mem_op(insn.Op2)
-
-                # op2 -- m32/m64
-                l_reg = cdg.load_operand(1)
-                l_mop = ida_hexrays.mop_t(l_reg, data_size)
-
-                # op1 -- xmm1
-                d_reg = ida_hexrays.reg2mreg(insn.Op1.reg)
-                d_mop = ida_hexrays.mop_t(d_reg, XMM_SIZE)
-
-                # xmm1[:data_size] = [mem]
-                insn = cdg.emit(ida_hexrays.m_xdu, l_mop, NO_MOP, d_mop)
-        
-                # clear xmm1[data_size:] bits (through ymm1)
-                clear_upper(cdg, d_reg, data_size)
-
-                return ida_hexrays.MERR_OK
+            if is_xmm_reg(insn.Op1) and is_mem_op(insn.Op2):
+                (d_reg, l_reg) = self.xmm1_xmm2_or_mem2()
+                self.emit_clear_ymm(d_reg)
+                self.emit_fp_instr_l_d(ida_hexrays.m_mov, ida_hexrays.mop_t(l_reg, data_size), ida_hexrays.mop_t(d_reg, data_size))
+                # clear_upper(cdg, d_reg, data_size)
 
             # op form: m32/m64, xmm1
-            else:
-                assert is_mem_op(insn.Op1) and is_xmm_reg(insn.Op2)
-
-                # op2 -- xmm1
-                l_reg = ida_hexrays.reg2mreg(insn.Op2.reg)
+            elif is_mem_op(insn.Op1) and is_xmm_reg(insn.Op2):
+                l_reg = self.xmmreg(insn.Op2)
                 l_mop = ida_hexrays.mop_t(l_reg, data_size)
-
                 # store xmm1[:data_size] into memory at [m32/m64] (op1)
                 insn = cdg.store_operand(0, l_mop)
                 insn.set_fpinsn()
-
-                return ida_hexrays.MERR_OK
-
+            else:
+                return self.decode_error('unknown format')
         # op form: xmm1, xmm2, xmm3 -- (3 operands)
         else:
-            assert is_xmm_reg(insn.Op1) and is_xmm_reg(insn.Op2) and is_xmm_reg(insn.Op3)
+            regs = (self.xmmreg(insn.Op1), self.xmmreg(insn.Op2), self.xmmreg(insn.Op3))
+            if not all(regs):
+                return self.decode_error("expected xmm, xmm, xmm form")
 
-            d_reg = ida_hexrays.reg2mreg(insn.Op1.reg)
-            l_reg = ida_hexrays.reg2mreg(insn.Op2.reg)
-            r_reg = ida_hexrays.reg2mreg(insn.Op3.reg)
+            (d_reg, l_reg, r_reg) = regs
 
-            # create a temp register to compute the final result into
-            t0_result = cdg.mba.alloc_kreg(XMM_SIZE)
+            self.emit_clear_ymm(d_reg)
+            self.emit_copy_bits_xmm_wide(d_reg, l_reg)
+            self.emit_fp_instr_l_d(ida_hexrays.m_mov, ida_hexrays.mop_t(r_reg, data_size), ida_hexrays.mop_t(d_reg, data_size))
 
-            # emit the microcode for this insn
-            cdg.emit(ida_hexrays.m_mov, XMM_SIZE, l_reg, 0, t0_result, 0)
-            cdg.emit(ida_hexrays.m_f2f, data_size, r_reg, 0, t0_result, 0)
-            cdg.emit(ida_hexrays.m_mov, XMM_SIZE, t0_result, 0, d_reg, 0)
-            cdg.mba.free_kreg(t0_result, XMM_SIZE)
-                
-            # clear xmm1[data_size:] bits (through ymm1)
-            clear_upper(cdg, d_reg, data_size)
-
-            return ida_hexrays.MERR_OK
+        return ida_hexrays.MERR_OK
 
         # failsafe
         assert "Unreachable..."
@@ -792,6 +1076,11 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         VMOVDQU xmm2/m128, xmm1
         VMOVDQU ymm1, ymm2/m256
         VMOVDQU ymm2/m256, ymm1
+
+        VMOVAPD xmm1, xmm2/m128
+        VMOVAPD xmm2/m128, xmm1
+        VMOVAPD ymm1, ymm2/m256
+        VMOVAPD ymm2/m256, ymm1
         """
 
         # op form: reg, [mem]
@@ -814,12 +1103,13 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
             d_reg = ida_hexrays.reg2mreg(insn.Op1.reg)
             d_mop = ida_hexrays.mop_t(d_reg, op_size)
 
-            # emit the microcode for this insn
-            cdg.emit(ida_hexrays.m_mov, l_mop, NO_MOP, d_mop)
-
             # clear upper 128 bits of ymm1
             if op_size == XMM_SIZE:
-                clear_upper(cdg, d_reg)
+                # clear_upper(cdg, d_reg)
+                self.emit_clear_ymm(d_reg)
+
+            # emit the microcode for this insn
+            cdg.emit(ida_hexrays.m_mov, l_mop, NO_MOP, d_mop)
 
             return ida_hexrays.MERR_OK
 
@@ -854,6 +1144,9 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
 
         VANDPS xmm1, xmm2, xmm3/m128
         VANDPS ymm1, ymm2, ymm3/m256
+
+        VXORPD xmm1, xmm2, xmm3/m128
+        VXORPD ymm1, ymm2, ymm3/m256
         """
         assert is_avx_reg(insn.Op1) and is_avx_reg(insn.Op2)
         op_size = XMM_SIZE if is_xmm_reg(insn.Op1) else YMM_SIZE
@@ -871,7 +1164,9 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
         {
             ida_allins.NN_vorps: ida_hexrays.m_or,
             ida_allins.NN_vandps: ida_hexrays.m_and,
+            ida_allins.NN_vandpd: ida_hexrays.m_and,
             ida_allins.NN_vxorps: ida_hexrays.m_xor,
+            ida_allins.NN_vxorpd: ida_hexrays.m_xor,
         }
 
         # get the hexrays microcode op to use for this instruction
@@ -957,22 +1252,171 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
 
         # get the hexrays microcode op to use for this instruction
         mcode_op = itype2mcode[insn.itype]
-        op_dtype = ida_ua.dt_float if op_size == FLOAT_SIZE else ida_ua.dt_double
-
-        # create a temp register to compute the final result into
-        t0_result = cdg.mba.alloc_kreg(XMM_SIZE)
 
         # emit the microcode for this insn
-        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, l_reg, 0, t0_result, 0)
-        cdg.emit_micro_mvm(mcode_op, op_dtype, l_reg, r_reg, t0_result, 0)
-        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, t0_result, 0, d_reg, 0)
-        cdg.mba.free_kreg(t0_result, 16)
+        self.emit_clear_ymm(d_reg)
+        l_mop = ida_hexrays.mop_t(l_reg, op_size)
+        r_mop = ida_hexrays.mop_t(r_reg, op_size)
+        d_mop = ida_hexrays.mop_t(d_reg, op_size)
+        self.emit_fp_instr_l_r_d(mcode_op, l_mop, r_mop, d_mop)
+
+        return ida_hexrays.MERR_OK
+
+    def _vfmaddxxxsd(self, cdg, insn):
+        """
+        VFMADD132SD xmm1, xmm2, xmm3/m64
+        VFMADD213SD xmm1, xmm2, xmm3/m64
+        VFMADD231SD xmm1, xmm2, xmm3/m64
+        """
+
+        regs = self.xmm1_xmm2_xmm3_or_mem3()
+        if regs is None:
+            return ida_hexrays.MERR_INSN
+        (d_reg, l_reg, r_reg) = regs
+
+        op_size = DOUBLE_SIZE
+        # wrap the source micro-reg as a micro-operand
+        r_mop = ida_hexrays.mop_t(r_reg, op_size)
+        l_mop = ida_hexrays.mop_t(l_reg, op_size)
+        d_mop = ida_hexrays.mop_t(d_reg, op_size)
+
+        order = []
+        if insn.itype == ida_allins.NN_vfmadd132sd:
+            order = [d_mop, r_mop, l_mop]
+        elif insn.itype == ida_allins.NN_vfmadd213sd:
+            order = [l_mop, d_mop, r_mop]
+        elif insn.itype == ida_allins.NN_vfmadd231sd:
+            order = [l_mop, r_mop, d_mop]
+        else:
+            return ida_hexrays.MERR_INSN
+
+        t1 = cdg.mba.alloc_kreg(XMM_SIZE)
+        t1_mop = ida_hexrays.mop_t(t1, op_size)
+
+        # t1 = l * r
+        cdg.emit(ida_hexrays.m_fmul, order[0], order[1], t1_mop)
+        # t2 = t1 + d
+        cdg.emit(ida_hexrays.m_fadd, t1_mop, order[2], d_mop)
+
+        cdg.mba.free_kreg(t1, XMM_SIZE)
 
         # clear upper 128 bits of ymm1
-        assert is_xmm_reg(insn.Op1)
         clear_upper(cdg, d_reg)
 
         return ida_hexrays.MERR_OK
+
+    def vfmadd132sd(self, cdg, insn):
+        return self._vfmaddxxxsd(cdg, insn)
+
+    def vfmadd213sd(self, cdg, insn):
+        return self._vfmaddxxxsd(cdg, insn)
+
+    def vfmadd231sd(self, cdg, insn):
+        return self._vfmaddxxxsd(cdg, insn)
+
+    def _vfnmaddxxxsd(self, cdg, insn):
+        """
+        VFNMADD132SD xmm1, xmm2,xmm3/m64
+        VFNMADD213SD xmm1, xmm2,xmm3/m64
+        VFNMADD231SD xmm1, xmm2,xmm3/m64
+        """
+
+        regs = self.xmm1_xmm2_xmm3_or_mem3()
+        if regs is None:
+            return ida_hexrays.MERR_INSN
+        (d_reg, l_reg, r_reg) = regs
+
+        op_size = DOUBLE_SIZE
+        # wrap the source micro-reg as a micro-operand
+        r_mop = ida_hexrays.mop_t(r_reg, op_size)
+        l_mop = ida_hexrays.mop_t(l_reg, op_size)
+        d_mop = ida_hexrays.mop_t(d_reg, op_size)
+
+        order = []
+        if insn.itype == ida_allins.NN_vfnmadd132sd:
+            order = [d_mop, r_mop, l_mop]
+        elif insn.itype == ida_allins.NN_vfnmadd213sd:
+            order = [l_mop, d_mop, r_mop]
+        elif insn.itype == ida_allins.NN_vfnmadd231sd:
+            order = [l_mop, r_mop, d_mop]
+        else:
+            return ida_hexrays.MERR_INSN
+
+        t1 = cdg.mba.alloc_kreg(XMM_SIZE)
+        t1_mop = ida_hexrays.mop_t(t1, op_size)
+
+        t2 = cdg.mba.alloc_kreg(XMM_SIZE)
+        t2_mop = ida_hexrays.mop_t(t2, op_size)
+
+        # t1 = l * r
+        cdg.emit(ida_hexrays.m_fmul, order[0], order[1], t1_mop)
+        # t2 = -t1
+        cdg.emit(ida_hexrays.m_fneg, t1_mop, NO_MOP, t2_mop)
+        # t3 = t2 + d
+        cdg.emit(ida_hexrays.m_fadd, t2_mop, order[2], d_mop)
+
+        cdg.mba.free_kreg(t1, XMM_SIZE)
+        cdg.mba.free_kreg(t2, XMM_SIZE)
+
+        # clear upper 128 bits of ymm1
+        clear_upper(cdg, d_reg)
+
+        return ida_hexrays.MERR_OK
+
+    def vfnmadd132sd(self, cdg, insn):
+        return self._vfnmaddxxxsd(cdg, insn)
+
+    def vfnmadd213sd(self, cdg, insn):
+        return self._vfnmaddxxxsd(cdg, insn)
+
+    def vfnmadd231sd(self, cdg, insn):
+        return self._vfnmaddxxxsd(cdg, insn)
+
+    def _vfmsubxxxsd(self, cdg, insn):
+        regs = self.xmm1_xmm2_xmm3_or_mem3()
+        if regs is None:
+            return ida_hexrays.MERR_INSN
+        (d_reg, l_reg, r_reg) = regs
+
+        op_size = DOUBLE_SIZE
+        # wrap the source micro-reg as a micro-operand
+        r_mop = ida_hexrays.mop_t(r_reg, op_size)
+        l_mop = ida_hexrays.mop_t(l_reg, op_size)
+        d_mop = ida_hexrays.mop_t(d_reg, op_size)
+
+        order = []
+        if insn.itype == ida_allins.NN_vfmsub132sd:
+            order = [d_mop, r_mop, l_mop]
+        elif insn.itype == ida_allins.NN_vfmsub213sd:
+            order = [l_mop, d_mop, r_mop]
+        elif insn.itype == ida_allins.NN_vfmsub231sd:
+            order = [l_mop, r_mop, d_mop]
+        else:
+            return ida_hexrays.MERR_INSN
+
+        t1 = cdg.mba.alloc_kreg(XMM_SIZE)
+        t1_mop = ida_hexrays.mop_t(t1, op_size)
+
+        # t1 = l * r
+        cdg.emit(ida_hexrays.m_fmul, order[0], order[1], t1_mop)
+        # t2 = t1 - d
+        cdg.emit(ida_hexrays.m_fsub, t1_mop, order[2], d_mop)
+
+        cdg.mba.free_kreg(t1, XMM_SIZE)
+
+        # clear upper 128 bits of ymm1
+        clear_upper(cdg, d_reg)
+
+        return ida_hexrays.MERR_OK
+
+    def vfmsub132sd(self, cdg, insn):
+        return self._vfmsubxxxsd(cdg, insn)
+
+    def vfmsub213sd(self, cdg, insn):
+        return self._vfmsubxxxsd(cdg, insn)
+
+    def vfmsub231sd(self, cdg, insn):
+        return self._vfmsubxxxsd(cdg, insn)
 
     def v_math_ps(self, cdg, insn):
         """
@@ -1013,6 +1457,10 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
             ida_allins.NN_vsubps: "_mm%u_sub_ps", 
             ida_allins.NN_vmulps: "_mm%u_mul_ps",
             ida_allins.NN_vdivps: "_mm%u_div_ps",
+
+            ida_allins.NN_vaddpd: "_mm%u_add_pd",
+            ida_allins.NN_vsubpd: "_mm%u_sub_pd",
+            ida_allins.NN_vmulpd: "_mm%u_mul_pd",
         }
 
         # create the intrinsic
@@ -1162,6 +1610,112 @@ class AVXLifter(ida_hexrays.microcode_filter_t):
 
         return ida_hexrays.MERR_OK
 
+    def minmaxsd(self, cdg, insn, funcName):
+        """
+        VMINSD xmm1, xmm2, xmm3/m64
+        VMAXSD xmm1, xmm2, xmm3/m64
+        """
+        # op3 -- xmm3
+        regs = self.xmm1_xmm2_xmm3_or_mem3()
+        if regs is None:
+            return ida_hexrays.MERR_INSN
+        (d_reg, l_reg, r_reg) = regs
+
+        t0_result = self.save_upper_bits(l_reg, XMM_SIZE)
+
+        avx_intrinsic = AVXIntrinsic(cdg, funcName)
+        avx_intrinsic.add_argument_reg_basic(l_reg, ida_typeinf.BTF_DOUBLE)
+        avx_intrinsic.add_argument_reg_basic(r_reg, ida_typeinf.BTF_DOUBLE)
+        avx_intrinsic.set_return_reg_basic(t0_result, ida_typeinf.BTF_DOUBLE)
+        avx_intrinsic.emit()
+
+        # store the fully computed result
+        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, t0_result, 0, d_reg, 0)
+        cdg.mba.free_kreg(t0_result, XMM_SIZE)
+
+        # clear upper 128 bits of ymm1
+        clear_upper(cdg, d_reg)
+
+        return ida_hexrays.MERR_OK
+
+    def vmaxsd(self, cdg, insn):
+        return self.minmaxsd(cdg, insn, "fmax")
+
+    def vminsd(self, cdg, insn):
+        return self.minmaxsd(cdg, insn, "fmin")
+
+    def vpxor(self, cdg, insn):
+        """
+        VPXOR xmm1, xmm2, xmm3/m128 // AVX
+        VPXOR ymm1, ymm2, ymm3/m256 // AVX2
+        """
+        if is_xmm_reg(insn.Op1) and is_xmm_reg(insn.Op2):
+            op_size = XMM_SIZE
+        elif is_ymm_reg(insn.Op1) and is_ymm_reg(insn.Op2):
+            op_size = YMM_SIZE
+        else:
+            return ida_hexrays.MERR_INSN
+
+        # op3 -- m128/m256
+        if is_mem_op(insn.Op3):
+            r_reg = cdg.load_operand(2)
+
+        # op3 -- xmm3/ymm3
+        elif is_xmm_reg(insn.Op3) and op_size == XMM_SIZE or is_ymm_reg(insn.Op3) and op_size == YMM_SIZE:
+            r_reg = ida_hexrays.reg2mreg(insn.Op3.reg)
+        else:
+            return ida_hexrays.MERR_INSN
+
+        # wrap the source micro-reg as a micro-operand
+        r_mop = ida_hexrays.mop_t(r_reg, op_size)
+
+        # op2 -- xmm2/ymm2
+        l_reg = ida_hexrays.reg2mreg(insn.Op2.reg)
+        l_mop = ida_hexrays.mop_t(l_reg, op_size)
+
+        # op1 -- xmm1/ymm1
+        d_reg = ida_hexrays.reg2mreg(insn.Op1.reg)
+        d_mop = ida_hexrays.mop_t(d_reg, op_size)
+
+        # emit the microcode for this insn
+        cdg.emit(ida_hexrays.m_xor, l_mop, r_mop, d_mop)
+
+        # clear upper 128 bits of ymm1
+        if op_size == XMM_SIZE:
+            clear_upper(cdg, d_reg)
+
+        return ida_hexrays.MERR_OK
+
+    def vroundsd(self, cdg, insn):
+        """
+        VROUNDSD xmm1, xmm2, xmm3/m64, imm8
+        """
+        # op3 -- xmm3
+        regs = self.xmm1_xmm2_xmm3_or_mem3()
+        if regs is None:
+            return ida_hexrays.MERR_INSN
+        (d_reg, l_reg, r_reg) = regs
+        if insn.Op4.type != ida_ua.o_imm:
+            return self.decode_error('op4')
+
+        t0_result = self.save_upper_bits(l_reg, XMM_SIZE)
+
+        avx_intrinsic = AVXIntrinsic(cdg, 'roundsd_avx' )
+        avx_intrinsic.add_argument_reg_basic(l_reg, ida_typeinf.BTF_DOUBLE)
+        avx_intrinsic.add_argument_reg_basic(r_reg, ida_typeinf.BTF_DOUBLE)
+        avx_intrinsic.add_argument_imm(insn.Op4.value, ida_typeinf.BTF_BYTE)
+        avx_intrinsic.set_return_reg_basic(t0_result, ida_typeinf.BTF_DOUBLE)
+        avx_intrinsic.emit()
+
+        # store the fully computed result
+        cdg.emit(ida_hexrays.m_mov, XMM_SIZE, t0_result, 0, d_reg, 0)
+        cdg.mba.free_kreg(t0_result, XMM_SIZE)
+
+        # clear upper 128 bits of ymm1
+        clear_upper(cdg, d_reg)
+
+        return ida_hexrays.MERR_OK
+
 #-----------------------------------------------------------------------------
 # Plugin
 #-----------------------------------------------------------------------------
@@ -1198,8 +1752,16 @@ class MicroAVX(ida_idaapi.plugin_t):
             return ida_idaapi.PLUGIN_SKIP
 
         # ensure the x64 decompiler is loaded
-        ida_loader.load_plugin("hexx64")
-        assert ida_hexrays.init_hexrays_plugin(), "Missing Hexx64 Decompiler..."
+        if ida_loader.load_plugin("hexx64") is None:
+            print("failed to load Hexx64 Decompiler...")
+            return ida_idaapi.PLUGIN_SKIP
+
+        if not ida_hexrays.init_hexrays_plugin():
+            print("failed to init Hexx64 Decompiler...")
+            return ida_idaapi.PLUGIN_SKIP
+
+        NO_MOP = ida_hexrays.mop_t()
+        NO_MOP.zero()
 
         # initialize the AVX lifter 
         self.avx_lifter = AVXLifter()

@@ -46,13 +46,11 @@ def size_of_operand(op):
             dt_ldbl, 32, 64 ]
     return n_bytes[op.dtype]
 
-def is_amd64_idb():
+def is_x86_idb():
     """
-    Return true if an x86_64 IDB is open.
+    Return true if an x86 or x86_64 IDB is open.
     """
-    if ida_idp.ph.id != ida_idp.PLFM_386:
-        return False
-    return ida_ida.cvar.inf.is_64bit()
+    return ida_idp.ph.id == ida_idp.PLFM_386
 
 def bytes2bits(n):
     """
@@ -1178,7 +1176,7 @@ class MicroAVX(ida_idaapi.plugin_t):
     """
 
     flags = ida_idaapi.PLUGIN_PROC | ida_idaapi.PLUGIN_HIDE
-    comment = "AVX support for the Hex-Rays x64 Decompiler"
+    comment = "AVX support for the Hex-Rays Decompiler"
     help = ""
     wanted_name = "MicroAVX"
     wanted_hotkey = ""
@@ -1194,12 +1192,13 @@ class MicroAVX(ida_idaapi.plugin_t):
         """
 
         # only bother to load the plugin for relevant sessions
-        if not is_amd64_idb():
+        if not is_x86_idb():
             return ida_idaapi.PLUGIN_SKIP
 
-        # ensure the x64 decompiler is loaded
-        ida_loader.load_plugin("hexx64")
-        assert ida_hexrays.init_hexrays_plugin(), "Missing Hexx64 Decompiler..."
+        # ensure the decompiler is loaded
+        if not ida_loader.load_plugin("hexrays"):
+            return ida_idaapi.PLUGIN_SKIP
+        assert ida_hexrays.init_hexrays_plugin(), "Missing the decompiler..."
 
         # initialize the AVX lifter 
         self.avx_lifter = AVXLifter()
